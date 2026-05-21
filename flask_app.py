@@ -1,16 +1,196 @@
 from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
-from my_supabase import get_user_progress, save_user_progress, signup, login, supabase, USER_PROGRESS_TABLE
-from dotenv import load_dotenv
-import requests
+from datetime import datetime, timezone
+from my_supabase import (
+    get_user_progress,
+    save_user_progress,
+    get_user_badges,
+    save_user_badges,
+    get_user_profile,
+    update_user_profile,
+    get_public_profile_by_username,
+    report_profile_bio,
+    list_bio_reports,
+    ban_profile_bio,
+    close_bio_report,
+    list_all_profiles,
+    get_account_ban_status,
+    ban_user_account,
+    unban_user_account,
+    backfill_normalized_user_tables,
+    signup,
+    login,
+    change_password,
+    delete_account,
+    get_admin_client,
+    supabase,
+    USER_PROGRESS_TABLE,
+)
+from config import (
+    SECRET_KEY,
+    TURNSTILE_KEY,
+    TURNSTILE_SECRET,
+    DISCORD_CLIENT_ID,
+    DISCORD_CLIENT_SECRET,
+    DISCORD_BOT_TOKEN,
+    DISCORD_GUILD_ID,
+    DISCORD_JOIN_REDIRECT,
+)
+import config as app_config
 import os
+import requests
+import base64
+import json
+from urllib.parse import urlencode
 import time
-from urllib.parse import urlparse
 
-load_dotenv()
 
-SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+def _coerce_users_list(value):
+    """Normalize supported users containers to a list."""
+    if isinstance(value, list):
+        # Some Supabase SDK versions return list_users() as a direct list of User objects.
+        if not value:
+            return value
+
+        first = value[0]
+        if isinstance(first, dict):
+            if "id" in first or "user_id" in first or "email" in first:
+                return value
+        else:
+            if hasattr(first, "id") or hasattr(first, "email"):
+                return value
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return None
+
+
+def _extract_users_from_admin_response(response_obj):
+    """Best-effort extractor for Supabase admin.list_users() responses across SDK versions."""
+    if response_obj is None:
+        return None
+
+    if isinstance(response_obj, dict):
+        users = _coerce_users_list(response_obj.get("users"))
+        if users is not None:
+            return users
+
+        data = response_obj.get("data")
+        if isinstance(data, dict):
+            users = _coerce_users_list(data.get("users"))
+            if users is not None:
+                return users
+
+        # Some SDK responses may expose payload under nested keys.
+        for key in ("result", "body", "payload"):
+            nested = response_obj.get(key)
+            extracted = _extract_users_from_admin_response(nested)
+            if extracted is not None:
+                return extracted
+        return None
+
+    if isinstance(response_obj, (list, tuple)):
+        direct_users = _coerce_users_list(response_obj)
+        if direct_users is not None:
+            return direct_users
+
+        for item in response_obj:
+            extracted = _extract_users_from_admin_response(item)
+            if extracted is not None:
+                return extracted
+        return None
+
+    model_dump_fn = getattr(response_obj, "model_dump", None)
+    if callable(model_dump_fn):
+        try:
+            dumped = model_dump_fn()
+            extracted = _extract_users_from_admin_response(dumped)
+            if extracted is not None:
+                return extracted
+        except Exception:
+            pass
+
+    dict_fn = getattr(response_obj, "dict", None)
+    if callable(dict_fn):
+        try:
+            dumped = dict_fn()
+            extracted = _extract_users_from_admin_response(dumped)
+            if extracted is not None:
+                return extracted
+        except Exception:
+            pass
+
+    users_attr = _coerce_users_list(getattr(response_obj, "users", None))
+    if users_attr is not None:
+        return users_attr
+
+    data_attr = getattr(response_obj, "data", None)
+    if isinstance(data_attr, dict):
+        users = _coerce_users_list(data_attr.get("users"))
+        if users is not None:
+            return users
+
+    # If .data is a custom object, recurse into it.
+    extracted_from_data = _extract_users_from_admin_response(data_attr)
+    if extracted_from_data is not None:
+        return extracted_from_data
+
+    nested_users = _coerce_users_list(getattr(data_attr, "users", None))
+    if nested_users is not None:
+        return nested_users
+
+    # Final fallback: inspect public attributes for nested payload-like objects.
+    attrs = getattr(response_obj, "__dict__", None)
+    if isinstance(attrs, dict):
+        extracted = _extract_users_from_admin_response(attrs)
+        if extracted is not None:
+            return extracted
+
+    return None
+
+
+def _count_auth_users() -> tuple[int | None, str | None]:
+    """Return (total_auth_users, error_message)."""
+    try:
+        admin_api = get_admin_client().auth.admin
+        page = 1
+        per_page = 1000
+        total = 0
+
+        while True:
+            try:
+                response_obj = admin_api.list_users(page=page, per_page=per_page)
+            except TypeError:
+                response_obj = admin_api.list_users({"page": page, "per_page": per_page})
+
+            users = _extract_users_from_admin_response(response_obj)
+            if users is None:
+                response_type = type(response_obj).__name__
+                attrs = []
+                try:
+                    attrs = [k for k in dir(response_obj) if not k.startswith("_")][:30]
+                except Exception:
+                    attrs = []
+
+                preview = ""
+                try:
+                    preview = repr(response_obj)
+                except Exception:
+                    preview = "<repr unavailable>"
+
+                return None, (
+                    "Could not parse users from admin.list_users response | "
+                    f"type={response_type} | attrs={attrs} | preview={preview[:400]}"
+                )
+
+            total += len(users)
+            if len(users) < per_page:
+                break
+            page += 1
+
+        return total, None
+    except Exception as exc:
+        return None, str(exc)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -19,6 +199,15 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
 )
+
+ALLOWED_CORS_ORIGINS = {
+    origin.strip()
+    for origin in (
+        os.getenv("CORS_ALLOWED_ORIGINS")
+        or "https://itlearn.be,https://it-learn.pages.dev,http://localhost:5500,http://127.0.0.1:5500"
+    ).split(",")
+    if origin.strip()
+}
 
 ALLOWED_OAUTH_PROVIDERS = {"google", "github", "discord"}
 DISCORD_OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
@@ -178,109 +367,199 @@ def api_admin_site_maintenance():
             "updated_by": next_state.get("updated_by"),
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Signup failed"}), 500
 
 # ------------------- CORS -------------------
-CORS(app, resources={r"/api/*": {"origins": [
-    "https://itlearn.be",
-    "https://it-learn.pages.dev"
-]}}, supports_credentials=True)
+# Allow the trusted frontends to call the API with credentials.
+CORS(
+    app,
+    resources={r"/api/*": {"origins": sorted(ALLOWED_CORS_ORIGINS)}},
+    supports_credentials=True,
+)
 
-# ------------------- AI access control -------------------
-AI_ALLOWED_PATH_PREFIXES = [
-    p.strip() for p in os.getenv("AI_ALLOWED_PATH_PREFIXES", "/").split(",") if p.strip()
-]
-# Also allow only these OpenAI-compatible system prompt keys.
-# Add/modify keys as needed.
-AI_SYSTEM_PROMPTS = {
-    # Example:
-    # "default": "You are a helpful IT learning assistant.",
-    "projects-assist":"You are a helpful assistent that helps students out with their questions on the projects they are making. The student can ask you any questions, as long as they are related to the project, and the project's context you got. You never write a whole block of code, you help the student and tell them to use their own brain. It is important to always explain very easy, and support the student. The student is learning, so you should not give them the answer, but help them to find the answer themselves. You can ask the student questions to help them find the answer. Always explain very easy, and support the student. Never go off the topic of the projects, don't answer unrelated questions."
-}
 
-# Basic limits (tune via env if you want)
-AI_MAX_PROMPT_CHARS = int(os.getenv("AI_MAX_PROMPT_CHARS", "40000"))
-AI_MAX_MESSAGES = int(os.getenv("AI_MAX_MESSAGES", "50"))
-AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "40"))
+@app.route("/api/site/status", methods=["GET", "OPTIONS"])
+def api_site_status():
+    if request.method == "OPTIONS":
+        return "", 200
+    return jsonify(_site_status_payload())
 
-# Very lightweight in-memory rate limiting (per-process)
-# { "<user_or_ip>": [timestamps...] }
-AI_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AI_RATE_LIMIT_WINDOW_SECONDS", "60"))
-AI_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("AI_RATE_LIMIT_MAX_REQUESTS", "20"))
-_ai_rate = {}
 
-def _get_user_or_ip():
+@app.route("/api/admin/system-health", methods=["GET", "OPTIONS"])
+def api_admin_system_health():
+    if request.method == "OPTIONS":
+        return "", 200
+
     user_id = session.get("user_id")
-    if user_id:
-        return f"user:{user_id}"
-    # Flask request.remote_addr is best effort (may be proxied)
-    return f"ip:{request.headers.get('X-Forwarded-For', request.remote_addr)}"
+    if not user_id:
+        return jsonify({"error": "Not logged in"}), 401
+    if not _is_bio_moderation_admin(user_id):
+        return jsonify({"error": "Forbidden"}), 403
 
-def _rate_limit_check():
-    key = _get_user_or_ip()
-    now = time.time()
-    bucket = _ai_rate.get(key, [])
-    bucket = [t for t in bucket if now - t <= AI_RATE_LIMIT_WINDOW_SECONDS]
-    if len(bucket) >= AI_RATE_LIMIT_MAX_REQUESTS:
-        return False
-    bucket.append(now)
-    _ai_rate[key] = bucket
-    return True
+    scope = (request.args.get("scope") or "full").strip().lower()
+    allowed_scopes = {"full", "api", "db", "auth"}
+    if scope not in allowed_scopes:
+        scope = "full"
 
-def _is_request_from_allowed_page():
-    # We restrict by Referer path. This is not foolproof (clients can forge headers),
-    # but it meaningfully reduces casual misuse and works with your requirement.
-    origin = request.headers.get("Origin", "")
-    referer = request.headers.get("Referer", "")
+    checked_at = datetime.now(timezone.utc).isoformat()
 
-    # Origin must be one of the allowed origins (CORS already restricts, but we double-check)
-    if origin not in {"https://itlearn.be", "https://it-learn.pages.dev"}:
-        return False
+    api_started = time.perf_counter()
+    api_info = {
+        "online": True,
+        "status_code": 200,
+        "response_time_ms": 0,
+    }
 
-    if not referer:
-        return False
+    db_info = {
+        "online": None,
+        "latency_ms": None,
+        "error": None,
+        "url": getattr(app_config, "SUPABASE_URL", ""),
+        "table": USER_PROGRESS_TABLE,
+        "total_profiles": None,
+    }
+
+    auth_info = {
+        "online": None,
+        "latency_ms": None,
+        "error": None,
+        "authenticated_users": None,
+    }
+
+    reports_info = {
+        "pending_open_reports": None,
+        "sample_limit": 500,
+        "error": None,
+    }
+
+    if scope in {"full", "db"}:
+        db_started = time.perf_counter()
+        try:
+            db_resp = get_admin_client().table(USER_PROGRESS_TABLE).select("user_id", count="exact").limit(1).execute()
+            counted = getattr(db_resp, "count", None)
+            if not isinstance(counted, int):
+                counted = len(getattr(db_resp, "data", []) or [])
+
+            db_info["online"] = True
+            db_info["total_profiles"] = int(counted)
+        except Exception as exc:
+            db_info["online"] = False
+            db_info["error"] = str(exc)
+        finally:
+            db_info["latency_ms"] = int((time.perf_counter() - db_started) * 1000)
+
+    if scope in {"full", "auth"}:
+        auth_started = time.perf_counter()
+        try:
+            total_auth_users, auth_error = _count_auth_users()
+            auth_info["authenticated_users"] = total_auth_users
+            auth_info["error"] = auth_error
+            auth_info["online"] = total_auth_users is not None and not auth_error
+        except Exception as exc:
+            auth_info["online"] = False
+            auth_info["error"] = str(exc)
+        finally:
+            auth_info["latency_ms"] = int((time.perf_counter() - auth_started) * 1000)
+
+    if scope == "full":
+        try:
+            open_reports = list_bio_reports(status="open", limit=reports_info["sample_limit"])
+            if isinstance(open_reports, dict) and "error" not in open_reports:
+                reports_info["pending_open_reports"] = len(open_reports.get("reports") or [])
+            else:
+                reports_info["error"] = (open_reports or {}).get("error", "Unknown error")
+        except Exception as exc:
+            reports_info["error"] = str(exc)
+
+    api_info["response_time_ms"] = int((time.perf_counter() - api_started) * 1000)
+
+    checks = []
+    if scope in {"full", "db"}:
+        checks.append(bool(db_info.get("online")))
+    if scope in {"full", "auth"}:
+        checks.append(bool(auth_info.get("online")))
+
+    overall_online = all(checks) if checks else True
+
+    avg_report_load = None
+    avg_profile_load = None
+    if scope == "full":
+        avg_report_load = db_info.get("latency_ms")
+        avg_profile_load = auth_info.get("latency_ms")
+
+    return jsonify({
+        "success": True,
+        "scope": scope,
+        "checked_at": checked_at,
+        "overall_status": "online" if overall_online else "degraded",
+        "api": api_info,
+        "database": db_info,
+        "auth": auth_info,
+        "reports": reports_info,
+        "metrics": {
+            "avg_report_load_ms": avg_report_load,
+            "avg_profile_load_ms": avg_profile_load,
+            "uptime_today_pct": None,
+        },
+    })
+
+# ------------------- Turnstile Validation -------------------
+def verify_turnstile(token: str, remote_ip: str | None = None) -> tuple[bool, str | None]:
+    """Verify Cloudflare Turnstile CAPTCHA and return a diagnostic error when available."""
+    if not token:
+        return False, "Missing CAPTCHA token"
+
+    if not TURNSTILE_SECRET:
+        return False, "Server CAPTCHA secret is not configured"
+
+    payload = {"secret": TURNSTILE_SECRET, "response": token}
+    if remote_ip:
+        payload["remoteip"] = remote_ip
 
     try:
-        parsed = urlparse(referer)
-        if parsed.netloc not in {"itlearn.be", "it-learn.pages.dev"}:
-            return False
+        response = requests.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data=payload,
+            timeout=10,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        return False, f"CAPTCHA verification request failed: {exc}"
+    except ValueError:
+        return False, "CAPTCHA verification returned invalid JSON"
 
-        path = parsed.path or "/"
-        return any(path.startswith(prefix) for prefix in AI_ALLOWED_PATH_PREFIXES)
-    except Exception:
-        return False
+    if result.get("success"):
+        return True, None
 
-def _extract_messages(payload: dict):
-    # Supported shapes:
-    # 1) { "messages": [ {role, content}, ... ] }
-    # 2) { "content": "..."}  -> converts to user message
-    messages = payload.get("messages")
-    if messages is None:
-        content = payload.get("content")
-        if content is None:
-            raise ValueError("Missing 'messages' or 'content'")
-        messages = [{"role": "user", "content": content}]
-
-    if not isinstance(messages, list):
-        raise ValueError("'messages' must be an array")
-
-    if len(messages) > AI_MAX_MESSAGES:
-        raise ValueError(f"Too many messages (max {AI_MAX_MESSAGES})")
-
-    normalized = []
-    for m in messages:
-        if not isinstance(m, dict):
-            raise ValueError("Each message must be an object")
-        role = m.get("role")
-        content = m.get("content")
-        if role not in {"system", "user", "assistant"}:
-            raise ValueError("Invalid message role")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("Each message 'content' must be a non-empty string")
-        normalized.append({"role": role, "content": content})
-    return normalized
+    error_codes = result.get("error-codes") or []
+    if isinstance(error_codes, list) and error_codes:
+        return False, f"CAPTCHA rejected token ({', '.join(str(c) for c in error_codes)})"
+    return False, "CAPTCHA rejected token"
 
 
+def ensure_user_progress_exists(user_id: str):
+    """Guarantee a progress row exists for OAuth sign-ins."""
+    default_progress = {
+        "progress": {},
+        "xp": 0,
+        "streak": 0,
+        "last_active": None,
+        "missions": {},
+        "mistakes": []
+    }
+
+    existing = get_user_progress(user_id)
+
+    if isinstance(existing, dict) and "error" in existing:
+        save_user_progress(user_id, default_progress)
+        return
+
+    # When the row does not yet exist, ensure we upsert a baseline entry.
+    if not existing or not existing.get("progress"):
+        payload = default_progress.copy()
+        payload.update({k: v for k, v in existing.items() if k not in payload})
+        save_user_progress(user_id, payload)
 
 # ------------------- PROGRESS -------------------
 @app.route("/api/progress/load", methods=["POST", "OPTIONS"])
@@ -294,7 +573,7 @@ def api_load_progress():
         progress_data = get_user_progress(user_id)
         return jsonify(progress_data)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to load progress"}), 500
 
 @app.route("/api/progress/save", methods=["POST", "OPTIONS"])
 def api_save_progress():
@@ -319,7 +598,7 @@ def api_save_progress():
             return jsonify({"error": error_text}), 500
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to save progress"}), 500
 
 @app.route("/api/badges/load", methods=["POST", "OPTIONS"])
 def api_load_badges():
@@ -334,7 +613,7 @@ def api_load_badges():
             return jsonify({"error": badges_data["error"]}), 500
         return jsonify({"badges": badges_data})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to load badges"}), 500
 
 @app.route("/api/badges/save", methods=["POST", "OPTIONS"])
 def api_save_badges():
@@ -351,7 +630,7 @@ def api_save_badges():
             return jsonify({"error": result["error"]}), 500
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to save badges"}), 500
 
 # ------------------- AUTH -------------------
 @app.route("/api/signup", methods=["POST", "OPTIONS"])
@@ -362,6 +641,8 @@ def api_signup():
         data = request.get_json() or {}
         email = data.get("email")
         password = data.get("password")
+        captcha_token = data.get("captcha_token")
+
         if not email or not password:
             return jsonify({"error": "Missing email or password"}), 400
 
@@ -388,7 +669,7 @@ def api_signup():
         return jsonify({"success": True, "user_id": user_id})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Signup failed"}), 500
 
 @app.route("/api/login", methods=["POST", "OPTIONS"])
 def api_login():
@@ -398,6 +679,8 @@ def api_login():
         data = request.get_json() or {}
         email = data.get("email")
         password = data.get("password")
+        captcha_token = data.get("captcha_token")
+
         if not email or not password:
             return jsonify({"error": "Missing email or password"}), 400
 
@@ -406,7 +689,7 @@ def api_login():
 
         # Attempt login
         result = login(email, password, captcha_token=captcha_token)
-        print(f"[LOGIN] Result: {result}")
+        print(f"[LOGIN] Result: {'success' if 'success' in result else 'error'}")
         
         if "error" in result:
             error_message = str(result["error"])
@@ -421,8 +704,8 @@ def api_login():
         session["user_id"] = user_id
         return jsonify({"success": True, "user_id": user_id})
     except Exception as e:
-        print(f"[LOGIN] Exception: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        print("[LOGIN] Exception during login")
+        return jsonify({"error": "Login failed"}), 500
 
 
 # ------------------- OAUTH -------------------
@@ -473,8 +756,8 @@ def api_oauth_start(provider: str):
 
         return jsonify({"url": url})
     except Exception as e:
-        print(f"[OAUTH][{normalized}] Start error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[OAUTH][{normalized}] Start error")
+        return jsonify({"error": "Failed to start OAuth flow"}), 500
 
 
 @app.route("/api/oauth/<provider>/complete", methods=["POST", "OPTIONS"])
@@ -500,7 +783,7 @@ def api_oauth_complete(provider: str):
                 access_token = getattr(session_obj, "access_token", None)
                 refresh_token = getattr(session_obj, "refresh_token", None)
             except Exception as exc:
-                print(f"[OAUTH][{normalized}] Code exchange failed: {exc}")
+                print(f"[OAUTH][{normalized}] Code exchange failed")
                 return jsonify({"error": "Failed to exchange auth code"}), 400
 
         # GitHub does not always return a refresh token; accept access token alone.
@@ -526,8 +809,8 @@ def api_oauth_complete(provider: str):
 
         return jsonify({"success": True, "user_id": user_id, "provider": normalized})
     except Exception as e:
-        print(f"[OAUTH][{normalized}] Complete error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[OAUTH][{normalized}] Complete error")
+        return jsonify({"error": "OAuth completion failed"}), 500
 
 
 # ------------------- DISCORD GUILD JOIN -------------------
@@ -593,8 +876,7 @@ def discord_join_callback():
             "code": code,
             "redirect_uri": DISCORD_JOIN_REDIRECT,
         }
-        print(f"[DISCORD JOIN] Token exchange - redirect_uri: {DISCORD_JOIN_REDIRECT}")
-        print(f"[DISCORD JOIN] Code (first 20 chars): {code[:20]}...")
+        print("[DISCORD JOIN] Token exchange started")
         
         token_res = requests.post(
             DISCORD_OAUTH_TOKEN,
@@ -604,8 +886,7 @@ def discord_join_callback():
         )
         
         if not token_res.ok:
-            error_detail = token_res.text
-            print(f"[DISCORD JOIN] Token exchange failed: {token_res.status_code} - {error_detail}")
+            print(f"[DISCORD JOIN] Token exchange failed: {token_res.status_code}")
         
         token_res.raise_for_status()
         tokens = token_res.json()
@@ -640,10 +921,8 @@ def discord_join_callback():
 
         return _discord_join_redirect(None, next_url)
     except Exception as exc:
-        import traceback
-        error_msg = f"{type(exc).__name__}: {str(exc)}"
-        traceback.print_exc()
-        print(f"[DISCORD JOIN] Exception: {error_msg}")
+        error_msg = type(exc).__name__
+        print("[DISCORD JOIN] Exception during Discord join")
         return _discord_join_redirect(f"Discord join error: {error_msg}")
 
 
@@ -700,7 +979,7 @@ def api_profile_me():
             return jsonify({"error": profile["error"]}), 500
         return jsonify(profile)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to load profile"}), 500
 
 @app.route("/api/profile/update", methods=["POST", "OPTIONS"])
 def api_profile_update():
@@ -727,7 +1006,7 @@ def api_profile_update():
             return jsonify({"error": updated["error"]}), 400
         return jsonify({"success": True, "profile": updated})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to update profile"}), 500
 
 
 @app.route("/api/profile/report-bio", methods=["POST", "OPTIONS"])
@@ -753,7 +1032,7 @@ def api_profile_report_bio():
             return jsonify({"error": result["error"]}), 400
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to report profile"}), 500
 
 
 @app.route("/api/admin/bio-reports", methods=["GET", "OPTIONS"])
@@ -780,7 +1059,7 @@ def api_admin_bio_reports():
             return jsonify({"error": result["error"]}), 500
         return jsonify({"reports": result.get("reports", [])})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to fetch reports"}), 500
 
 
 @app.route("/api/admin/bio-reports/close", methods=["POST", "OPTIONS"])
@@ -806,7 +1085,7 @@ def api_admin_close_bio_report():
             return jsonify({"error": result["error"]}), 400
         return jsonify({"success": True, "report": result})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to close report"}), 500
 
 
 @app.route("/api/admin/profiles", methods=["GET", "OPTIONS"])
@@ -832,7 +1111,7 @@ def api_admin_profiles():
             return jsonify({"error": result["error"]}), 500
         return jsonify({"profiles": result.get("profiles", [])})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to list profiles"}), 500
 
 
 @app.route("/api/admin/profile/ban-bio", methods=["POST", "OPTIONS"])
@@ -858,7 +1137,7 @@ def api_admin_ban_profile_bio():
             return jsonify({"error": result["error"]}), 400
         return jsonify({"success": True, "profile": result})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to ban profile"}), 500
 
 
 @app.route("/api/admin/profile/ban-account", methods=["POST", "OPTIONS"])
@@ -890,7 +1169,7 @@ def api_admin_ban_account():
             return jsonify({"error": result["error"]}), 400
         return jsonify({"success": True, "profile": result})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to ban account"}), 500
 
 
 @app.route("/api/admin/profile/unban-account", methods=["POST", "OPTIONS"])
@@ -916,7 +1195,7 @@ def api_admin_unban_account():
             return jsonify({"error": result["error"]}), 400
         return jsonify({"success": True, "profile": result})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to unban account"}), 500
 
 
 @app.route("/api/admin/backfill-normalized-tables", methods=["POST", "OPTIONS"])
@@ -943,7 +1222,7 @@ def api_admin_backfill_normalized_tables():
             return jsonify({"error": result["error"]}), 500
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Backfill failed"}), 500
 
 @app.route("/api/profile/<username>", methods=["GET", "OPTIONS"])
 def api_profile_public(username: str):
@@ -956,7 +1235,7 @@ def api_profile_public(username: str):
             return jsonify({"error": profile["error"]}), status
         return jsonify(profile)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to load public profile"}), 500
 
 @app.route("/@<username>", methods=["GET"])
 def public_profile_redirect(username: str):
@@ -983,7 +1262,7 @@ def api_user_count():
 
         return jsonify({"totalUsers": int(total_users)})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failed to count users"}), 500
 
 # ------------------- TRIAL MODE -------------------
 @app.route("/api/trial/link", methods=["POST", "OPTIONS"])
@@ -1054,7 +1333,7 @@ def api_trial_link():
         if "error" in result:
             return jsonify({"error": "Failed to save progress: " + result["error"]}), 500
         
-        print(f"[TRIAL] Successfully linked trial progress for user {user_id}, course {course_id}")
+        print("[TRIAL] Successfully linked trial progress")
         return jsonify({
             "success": True,
             "message": "Trial progress linked successfully",
@@ -1062,8 +1341,8 @@ def api_trial_link():
         })
     
     except Exception as e:
-        print(f"[TRIAL] Error linking trial progress: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        print("[TRIAL] Error linking trial progress")
+        return jsonify({"error": "Failed to link trial progress"}), 500
 
 # ------------------- ACCOUNT MANAGEMENT -------------------
 @app.route("/api/change-password", methods=["POST", "OPTIONS"])
@@ -1089,7 +1368,7 @@ def api_change_password():
         
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Password change failed"}), 500
 
 @app.route("/api/delete-account", methods=["POST", "OPTIONS"])
 def api_delete_account():
@@ -1107,83 +1386,4 @@ def api_delete_account():
         session.pop("user_id", None)
         return jsonify({"success": True})
     except Exception as e:
-        return jsonify({"error": str(e)})
-
-# ------------------ AI PROXY ---------------------------
-@app.route("/api/ai", methods=["POST", "OPTIONS"])
-def api_ai():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    if not OPENAI_API_KEY:
-        return jsonify({"error": "Server misconfigured: missing OPENAI_API_KEY"}), 500
-
-    if not _is_request_from_allowed_page():
-        return jsonify({"error": "Forbidden"}), 403
-
-    if not _rate_limit_check():
-        return jsonify({"error": "Rate limit exceeded"}), 429
-
-    system_prompt_key = request.args.get("p", "default")
-    system_prompt = AI_SYSTEM_PROMPTS.get(system_prompt_key)
-    if not system_prompt:
-        return jsonify({"error": "Unknown system prompt key"}), 400
-
-    try:
-        payload = request.get_json(force=True) or {}
-        messages = _extract_messages(payload)
-
-        # Hard stop on size
-        total_chars = sum(len(m.get("content", "")) for m in messages)
-        if total_chars > AI_MAX_PROMPT_CHARS:
-            return jsonify({"error": f"Request too large (max {AI_MAX_PROMPT_CHARS} chars)"}), 413
-
-        model = payload.get("model", "google/gemini-3.1-flash-lite")
-        temperature = payload.get("temperature", 0.2)
-
-        # Build OpenAI messages: system prompt first, then client messages
-        openai_messages = [{"role": "system", "content": system_prompt}] + messages
-
-        openai_payload = {
-            "model": model,
-            "messages": openai_messages,
-            "temperature": temperature,
-        }
-
-        # If frontend wants streaming later, we can add it.
-        # For now: non-streaming response.
-        resp = requests.post(
-            "https://ai.hackclub.com/proxy/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=openai_payload,
-            timeout=AI_TIMEOUT_SECONDS,
-        )
-
-        if resp.status_code >= 400:
-            # Don’t leak upstream body too much; still return useful error
-            try:
-                data = resp.json()
-            except Exception:
-                data = None
-
-            if isinstance(data, dict) and data:
-                return jsonify(
-                    {"error": data.get("error", data), "status": resp.status_code}
-                ), resp.status_code
-
-            # Fallback: include truncated text
-            text = (resp.text or "").strip()
-            if len(text) > 2000:
-                text = text[:2000] + "...(truncated)"
-            return jsonify({"error": "OpenAI request failed", "status": resp.status_code, "body": text}), resp.status_code
-
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return jsonify({"ok": True, "content": content, "model": model})
-    except ValueError as ve:
-        return jsonify({"error": str(ve)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Account deletion failed"}), 500

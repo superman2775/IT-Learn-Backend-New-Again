@@ -1,47 +1,44 @@
 from supabase import create_client, Client
-from dotenv import load_dotenv
-import os
+from config import SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_SECRET_KEY, USER_PROGRESS_TABLE
 from datetime import datetime
 import re
 import os
 import uuid
 import config as app_config
 
-load_dotenv()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY")
-USER_PROGRESS_TABLE = os.getenv("USER_PROGRESS_TABLE", "user_progress")
-
 # ------------------- Supabase client -------------------
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
 _admin_db_client: Client | None = None
 
 # ------------------- Auth Helpers -------------------
 def get_admin_client():
     """Get Supabase client with admin access"""
     # Priority 1: Environment variables
+    env_secret_key = os.getenv("SUPABASE_SECRET_KEY")
     env_service_role = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     env_service_key = os.getenv("SUPABASE_SERVICE_KEY")
     
     # Priority 2: Config module attributes
+    config_secret_key = getattr(app_config, "SUPABASE_SECRET_KEY", None)
     config_service_role = getattr(app_config, "SUPABASE_SERVICE_ROLE_KEY", None)
     config_service_key = getattr(app_config, "SUPABASE_SERVICE_KEY", None)
     
     # Priority 3: Direct import
-    imported_key = SUPABASE_SERVICE_ROLE_KEY
+    imported_key = SUPABASE_SECRET_KEY
     
-    service_role_key = env_service_role or env_service_key or config_service_role or config_service_key or imported_key
+    service_role_key = env_secret_key or env_service_role or env_service_key or config_secret_key or config_service_role or config_service_key or imported_key
     
     # Verify we have a non-empty service role key
     if not service_role_key or not str(service_role_key).strip():
         print("[SUPABASE] ERROR: Service role key is empty or None!")
+        print(f"[SUPABASE]   env_secret_key: {'✓' if env_secret_key else '✗'}")
         print(f"[SUPABASE]   env_service_role: {'✓' if env_service_role else '✗'}")
         print(f"[SUPABASE]   env_service_key: {'✓' if env_service_key else '✗'}")
+        print(f"[SUPABASE]   config_secret_key: {'✓' if config_secret_key else '✗'}")
         print(f"[SUPABASE]   config_service_role: {'✓' if config_service_role else '✗'}")
         print(f"[SUPABASE]   config_service_key: {'✓' if config_service_key else '✗'}")
-        print(f"[SUPABASE]   imported_key: {'✓' if imported_key else '✗'} (first 20 chars: {str(imported_key)[:20] if imported_key else 'NONE'})")
-        raise ValueError("SUPABASE_SERVICE_ROLE_KEY not configured properly!")
+        print(f"[SUPABASE]   imported_key: {'✓' if imported_key else '✗'}")
+        raise ValueError("SUPABASE_SECRET_KEY not configured properly!")
     
     admin_key = service_role_key
     
@@ -57,6 +54,20 @@ def get_db_client() -> Client:
         _admin_db_client = get_admin_client()
         print("[SUPABASE] Initialized admin DB client")
     return _admin_db_client
+
+
+def _normalize_auth_error(error_msg: str, fallback: str) -> str:
+    message = str(error_msg or "").strip()
+    lower_message = message.lower()
+
+    if "invalid-input-secret" in lower_message:
+        return "CAPTCHA secret is invalid or misconfigured"
+    if "captcha" in lower_message:
+        return "CAPTCHA validation failed"
+    if "rate" in lower_message or "500" in lower_message:
+        return fallback
+
+    return fallback
 
 # ------------------- Progress -------------------
 def _as_int(value, default=0):
@@ -1402,14 +1413,14 @@ def unban_user_account(target_user_id: str, admin_user_id: str) -> dict:
 # ------------------- Auth -------------------
 def signup(email: str, password: str, captcha_token: str | None = None) -> dict:
     try:
-        print(f"[SUPABASE] Attempting signup for: {email}")
+        print("[SUPABASE] Attempting signup")
 
         # Clear any existing session before creating a new account
         try:
             supabase.auth.sign_out()
             print("[SUPABASE] Cleared any existing session before signup")
         except Exception as e:
-            print(f"[SUPABASE] Sign-out before signup failed (ignored): {e}")
+            print("[SUPABASE] Sign-out before signup failed (ignored)")
 
         signup_payload = {"email": email, "password": password}
         if captcha_token:
@@ -1419,18 +1430,18 @@ def signup(email: str, password: str, captcha_token: str | None = None) -> dict:
         if not user.user:
             print("[SUPABASE] Signup failed - no user returned")
             return {"error": "Signup failed"}
-        print(f"[SUPABASE] Signup successful for user: {user.user.id}")
+        print("[SUPABASE] Signup successful")
         return {"success": True, "user_id": user.user.id}
     except Exception as e:
+        print("[SUPABASE] Signup exception")
         error_msg = str(e)
-        print(f"[SUPABASE] Signup exception: {error_msg}")
         if "500" in error_msg or "rate" in error_msg.lower():
             return {"error": "Too many signup attempts. Please wait a moment and try again."}
-        return {"error": error_msg if error_msg else "Signup failed"}
+        return {"error": _normalize_auth_error(error_msg, "Signup failed")}
 
 def login(email: str, password: str, captcha_token: str | None = None) -> dict:
     try:
-        print(f"[SUPABASE] Attempting login for: {email}")
+        print("[SUPABASE] Attempting login")
         
         # Sign out any existing session first to avoid conflicts
         try:
@@ -1447,38 +1458,37 @@ def login(email: str, password: str, captcha_token: str | None = None) -> dict:
         if not user.user:
             print(f"[SUPABASE] Login failed - no user returned")
             return {"error": "Invalid credentials"}
-        print(f"[SUPABASE] Login successful for user: {user.user.id}")
+        print("[SUPABASE] Login successful")
         return {"success": True, "user_id": user.user.id}
     except Exception as e:
-        error_msg = str(e)
-        print(f"[SUPABASE] Login exception: {error_msg}")
+        print("[SUPABASE] Login exception")
         # Check for rate limit or Supabase errors
+        error_msg = str(e)
         if "500" in error_msg or "rate" in error_msg.lower():
             return {"error": "Too many login attempts. Please wait a moment and try again."}
-        return {"error": error_msg if error_msg else "Login failed"}
+        return {"error": _normalize_auth_error(error_msg, "Login failed")}
 
 def change_password(user_id: str, current_password: str, new_password: str) -> dict:
     """Change user password using Supabase Admin API"""
     try:
-        print(f"[SUPABASE] Attempting password change for user: {user_id}")
+        print("[SUPABASE] Attempting password change")
         admin = get_admin_client()
         # Use Supabase admin API with proper error handling
         result = admin.auth.admin.update_user_by_id(
             user_id,
             {"password": new_password}
         )
-        print(f"[SUPABASE] Password changed successfully for user: {user_id}")
+        print("[SUPABASE] Password changed successfully")
         return {"success": True}
     except Exception as e:
-        error_msg = str(e)
-        print(f"[SUPABASE] Password change exception: {error_msg}")
+        print("[SUPABASE] Password change exception")
         # Return success anyway to avoid blocking user
         return {"success": True, "message": "Password update initiated"}
 
 def delete_account(user_id: str) -> dict:
     """Delete user account and all associated data"""
     try:
-        print(f"[SUPABASE] Attempting to delete account for user: {user_id}")
+        print("[SUPABASE] Attempting to delete account")
         admin = get_admin_client()
         
         # First delete user progress data
@@ -1491,15 +1501,14 @@ def delete_account(user_id: str) -> dict:
             get_db_client().table(USER_GAMIFICATION_QUESTS_TABLE).delete().eq("user_id", uid).execute()
             get_db_client().table(USER_GAMIFICATION_STATE_TABLE).delete().eq("user_id", uid).execute()
             get_db_client().table(USER_PROFILE_EFFECTS_TABLE).delete().eq("user_id", uid).execute()
-        print(f"[SUPABASE] Deleted user progress for: {user_id}")
+        print("[SUPABASE] Deleted user progress")
         
         # Then delete the user account using admin API
         admin.auth.admin.delete_user(user_id)
-        print(f"[SUPABASE] Deleted user account: {user_id}")
+        print("[SUPABASE] Deleted user account")
         return {"success": True}
     except Exception as e:
-        error_msg = str(e)
-        print(f"[SUPABASE] Account deletion exception: {error_msg}")
+        print("[SUPABASE] Account deletion exception")
         # Still try to delete progress if user deletion fails
         try:
             get_db_client().table(USER_PROGRESS_TABLE).delete().eq("user_id", user_id).execute()
@@ -1511,7 +1520,7 @@ def delete_account(user_id: str) -> dict:
                 get_db_client().table(USER_GAMIFICATION_QUESTS_TABLE).delete().eq("user_id", uid).execute()
                 get_db_client().table(USER_GAMIFICATION_STATE_TABLE).delete().eq("user_id", uid).execute()
                 get_db_client().table(USER_PROFILE_EFFECTS_TABLE).delete().eq("user_id", uid).execute()
-            print(f"[SUPABASE] Progress deleted despite user deletion error")
+            print("[SUPABASE] Progress deleted despite user deletion error")
         except:
             pass
         # Return success anyway since at least progress is deleted
