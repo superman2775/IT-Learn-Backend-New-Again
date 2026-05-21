@@ -35,15 +35,110 @@ from config import (
     DISCORD_BOT_TOKEN,
     DISCORD_GUILD_ID,
     DISCORD_JOIN_REDIRECT,
+    OPENAI_API_KEY,
 )
 import config as app_config
 import os
 import requests
 import base64
 import json
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 import time
 
+
+# ------------------- AI access control -------------------
+AI_ALLOWED_PATH_PREFIXES = [
+    p.strip() for p in os.getenv("AI_ALLOWED_PATH_PREFIXES", "/").split(",") if p.strip()
+]
+# Also allow only these OpenAI-compatible system prompt keys.
+# Add/modify keys as needed.
+AI_SYSTEM_PROMPTS = {
+    # Example:
+    # "default": "You are a helpful IT learning assistant.",
+    "projects-assist":"You are a helpful assistent that helps students out with their questions on the projects they are making. The student can ask you any questions, as long as they are related to the project, and the project's context you got. You never write a whole block of code, you help the student and tell them to use their own brain. It is important to always explain very easy, and support the student. The student is learning, so you should not give them the answer, but help them to find the answer themselves. You can ask the student questions to help them find the answer. Always explain very easy, and support the student. Never go off the topic of the projects, don't answer unrelated questions."
+}
+
+# Basic limits (tune via env if you want)
+AI_MAX_PROMPT_CHARS = int(os.getenv("AI_MAX_PROMPT_CHARS", "40000"))
+AI_MAX_MESSAGES = int(os.getenv("AI_MAX_MESSAGES", "50"))
+AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "40"))
+
+# Very lightweight in-memory rate limiting (per-process)
+# { "<user_or_ip>": [timestamps...] }
+AI_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AI_RATE_LIMIT_WINDOW_SECONDS", "60"))
+AI_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("AI_RATE_LIMIT_MAX_REQUESTS", "20"))
+_ai_rate = {}
+
+def _get_user_or_ip():
+    user_id = session.get("user_id")
+    if user_id:
+        return f"user:{user_id}"
+    # Flask request.remote_addr is best effort (may be proxied)
+    return f"ip:{request.headers.get('X-Forwarded-For', request.remote_addr)}"
+
+def _rate_limit_check():
+    key = _get_user_or_ip()
+    now = time.time()
+    bucket = _ai_rate.get(key, [])
+    bucket = [t for t in bucket if now - t <= AI_RATE_LIMIT_WINDOW_SECONDS]
+    if len(bucket) >= AI_RATE_LIMIT_MAX_REQUESTS:
+        return False
+    bucket.append(now)
+    _ai_rate[key] = bucket
+    return True
+
+def _is_request_from_allowed_page():
+    # We restrict by Referer path. This is not foolproof (clients can forge headers),
+    # but it meaningfully reduces casual misuse and works with your requirement.
+    origin = request.headers.get("Origin", "")
+    referer = request.headers.get("Referer", "")
+
+    # Origin must be one of the allowed origins (CORS already restricts, but we double-check)
+    if origin not in {"https://itlearn.be", "https://it-learn.pages.dev"}:
+        return False
+
+    if not referer:
+        return False
+
+    try:
+        parsed = urlparse(referer)
+        if parsed.netloc not in {"itlearn.be", "it-learn.pages.dev"}:
+            return False
+
+        path = parsed.path or "/"
+        return any(path.startswith(prefix) for prefix in AI_ALLOWED_PATH_PREFIXES)
+    except Exception:
+        return False
+
+def _extract_messages(payload: dict):
+    # Supported shapes:
+    # 1) { "messages": [ {role, content}, ... ] }
+    # 2) { "content": "..."}  -> converts to user message
+    messages = payload.get("messages")
+    if messages is None:
+        content = payload.get("content")
+        if content is None:
+            raise ValueError("Missing 'messages' or 'content'")
+        messages = [{"role": "user", "content": content}]
+
+    if not isinstance(messages, list):
+        raise ValueError("'messages' must be an array")
+
+    if len(messages) > AI_MAX_MESSAGES:
+        raise ValueError(f"Too many messages (max {AI_MAX_MESSAGES})")
+
+    normalized = []
+    for m in messages:
+        if not isinstance(m, dict):
+            raise ValueError("Each message must be an object")
+        role = m.get("role")
+        content = m.get("content")
+        if role not in {"system", "user", "assistant"}:
+            raise ValueError("Invalid message role")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Each message 'content' must be a non-empty string")
+        normalized.append({"role": role, "content": content})
+    return normalized
 
 def _coerce_users_list(value):
     """Normalize supported users containers to a list."""
@@ -1387,3 +1482,83 @@ def api_delete_account():
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": "Account deletion failed"}), 500
+
+
+# ------------------ AI PROXY ---------------------------
+@app.route("/api/ai", methods=["POST", "OPTIONS"])
+def api_ai():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "Server misconfigured: missing OPENAI_API_KEY"}), 500
+
+    if not _is_request_from_allowed_page():
+        return jsonify({"error": "Forbidden"}), 403
+
+    if not _rate_limit_check():
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    system_prompt_key = request.args.get("p", "default")
+    system_prompt = AI_SYSTEM_PROMPTS.get(system_prompt_key)
+    if not system_prompt:
+        return jsonify({"error": "Unknown system prompt key"}), 400
+
+    try:
+        payload = request.get_json(force=True) or {}
+        messages = _extract_messages(payload)
+
+        # Hard stop on size
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        if total_chars > AI_MAX_PROMPT_CHARS:
+            return jsonify({"error": f"Request too large (max {AI_MAX_PROMPT_CHARS} chars)"}), 413
+
+        model = payload.get("model", "google/gemini-3.1-flash-lite")
+        temperature = payload.get("temperature", 0.2)
+
+        # Build OpenAI messages: system prompt first, then client messages
+        openai_messages = [{"role": "system", "content": system_prompt}] + messages
+
+        openai_payload = {
+            "model": model,
+            "messages": openai_messages,
+            "temperature": temperature,
+        }
+
+        # If frontend wants streaming later, we can add it.
+        # For now: non-streaming response.
+        resp = requests.post(
+            "https://ai.hackclub.com/proxy/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=openai_payload,
+            timeout=AI_TIMEOUT_SECONDS,
+        )
+
+        if resp.status_code >= 400:
+            # Don’t leak upstream body too much; still return useful error
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+
+            if isinstance(data, dict) and data:
+                return jsonify(
+                    {"error": data.get("error", data), "status": resp.status_code}
+                ), resp.status_code
+
+            # Fallback: include truncated text
+            text = (resp.text or "").strip()
+            if len(text) > 2000:
+                text = text[:2000] + "...(truncated)"
+            return jsonify({"error": "OpenAI request failed", "status": resp.status_code, "body": text}), resp.status_code
+
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return jsonify({"ok": True, "content": content, "model": model})
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
