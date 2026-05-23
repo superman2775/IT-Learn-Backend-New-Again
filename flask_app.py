@@ -94,7 +94,7 @@ def _is_request_from_allowed_page():
     referer = request.headers.get("Referer", "")
 
     # Origin must be one of the allowed origins (CORS already restricts, but we double-check)
-    if origin not in {"https://itlearn.be", "https://it-learn.pages.dev"}:
+    if origin not in {"https://itlearn.be", "https://it-learn.pages.dev", "https://beta.itlearn.be", "https://it-learn-beta.pages.dev"}:
         return False
 
     if not referer:
@@ -785,7 +785,7 @@ def api_login():
         # Attempt login
         result = login(email, password, captcha_token=captcha_token)
         print(f"[LOGIN] Result: {'success' if 'success' in result else 'error'}")
-        
+
         if "error" in result:
             error_message = str(result["error"])
             status_code = 400 if "captcha" in error_message.lower() else 401
@@ -972,17 +972,17 @@ def discord_join_callback():
             "redirect_uri": DISCORD_JOIN_REDIRECT,
         }
         print("[DISCORD JOIN] Token exchange started")
-        
+
         token_res = requests.post(
             DISCORD_OAUTH_TOKEN,
             data=token_data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=10,
         )
-        
+
         if not token_res.ok:
             print(f"[DISCORD JOIN] Token exchange failed: {token_res.status_code}")
-        
+
         token_res.raise_for_status()
         tokens = token_res.json()
         user_access_token = tokens.get("access_token")
@@ -1365,25 +1365,25 @@ def api_trial_link():
     """Link trial progress to newly created user account"""
     if request.method == "OPTIONS":
         return "", 200
-    
+
     user_id = session.get("user_id")
     if not user_id:
         return jsonify({"error": "Not logged in"}), 401
-    
+
     try:
         data = request.get_json()
-        
+
         # Validate required fields
         if not data:
             return jsonify({"error": "No trial data provided"}), 400
-        
+
         session_id = data.get("sessionId")
         course_id = data.get("courseId")
         chapters = data.get("chapters", [])
-        
+
         if not session_id or not course_id:
             return jsonify({"error": "Missing required trial data"}), 400
-        
+
         # Get existing user progress
         existing_progress = get_user_progress(user_id)
         if "error" in existing_progress:
@@ -1395,46 +1395,46 @@ def api_trial_link():
                 "missions": {},
                 "mistakes": []
             }
-        
+
         # Initialize progress structure if needed
         if "progress" not in existing_progress:
             existing_progress["progress"] = {}
-        
+
         # Add trial course to progress if it doesn't exist
         if course_id not in existing_progress["progress"]:
             existing_progress["progress"][course_id] = {
                 "started": True,
                 "chapters": {}
             }
-        
+
         # Link trial chapters to user progress
         if "chapters" not in existing_progress["progress"][course_id]:
             existing_progress["progress"][course_id]["chapters"] = {}
-        
+
         for chapter in chapters:
             chapter_id = chapter.get("chapterId")
             chapter_data = chapter.get("data", {})
-            
+
             if chapter_id:
                 # Merge chapter data, preserving any existing data
                 if chapter_id not in existing_progress["progress"][course_id]["chapters"]:
                     existing_progress["progress"][course_id]["chapters"][chapter_id] = {}
-                
+
                 existing_progress["progress"][course_id]["chapters"][chapter_id].update(chapter_data)
-        
+
         # Save updated progress
         result = save_user_progress(user_id, existing_progress)
-        
+
         if "error" in result:
             return jsonify({"error": "Failed to save progress: " + result["error"]}), 500
-        
+
         print("[TRIAL] Successfully linked trial progress")
         return jsonify({
             "success": True,
             "message": "Trial progress linked successfully",
             "chapters_linked": len(chapters)
         })
-    
+
     except Exception as e:
         print("[TRIAL] Error linking trial progress")
         return jsonify({"error": "Failed to link trial progress"}), 500
@@ -1450,17 +1450,17 @@ def api_change_password():
     try:
         data = request.get_json()
         new_password = data.get("new_password")
-        
+
         if not new_password:
             return jsonify({"error": "Missing new password"}), 400
-        
+
         if len(new_password) < 6:
             return jsonify({"error": "Password must be at least 6 characters"}), 400
-        
+
         result = change_password(user_id, None, new_password)
         if "error" in result:
             return jsonify({"error": result["error"]}), 500
-        
+
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": "Password change failed"}), 500
@@ -1476,7 +1476,7 @@ def api_delete_account():
         result = delete_account(user_id)
         if "error" in result:
             return jsonify({"error": result["error"]}), 500
-        
+
         # Clear session
         session.pop("user_id", None)
         return jsonify({"success": True})
@@ -1538,7 +1538,7 @@ def api_ai():
         )
 
         if resp.status_code >= 400:
-            # Don’t leak upstream body too much; still return useful error
+            # Donï¿½t leak upstream body too much; still return useful error
             try:
                 data = resp.json()
             except Exception:
