@@ -525,6 +525,316 @@ def api_save_badges():
         if "error" in result:
             return jsonify({"error": result["error"]}), 500
         return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": "Failed to save badges"}), 500
+
+# ------------------- AUTH -------------------
+@app.route("/api/signup", methods=["POST", "OPTIONS"])
+def api_signup():
+    if request.method == "OPTIONS":
+        return "", 200
+    try:
+        data = request.get_json() or {}
+        email = data.get("email")
+        password = data.get("password")
+        captcha_token = data.get("captcha_token")
+
+        if not email or not password:
+            return jsonify({"error": "Missing email or password"}), 400
+
+        if not captcha_token:
+            return jsonify({"error": "CAPTCHA token missing"}), 400
+
+        result = signup(email, password, captcha_token=captcha_token)
+        if "error" in result:
+            error_message = str(result["error"])
+            status_code = 400 if "captcha" in error_message.lower() else 500
+            return jsonify({"error": error_message}), status_code
+
+        user_id = result["user_id"]
+        save_user_progress(user_id, {
+            "progress": {},
+            "xp": 0,
+            "streak": 0,
+            "last_active": None,
+            "missions": {},
+            "mistakes": []
+        })
+
+        session["user_id"] = user_id
+        return jsonify({"success": True, "user_id": user_id})
+
+    except Exception as e:
+        return jsonify({"error": "Signup failed"}), 500
+
+@app.route("/api/login", methods=["POST", "OPTIONS"])
+def api_login():
+    if request.method == "OPTIONS":
+        return "", 200
+    try:
+        data = request.get_json() or {}
+        email = data.get("email")
+        password = data.get("password")
+        captcha_token = data.get("captcha_token")
+
+        if not email or not password:
+            return jsonify({"error": "Missing email or password"}), 400
+
+        if not captcha_token:
+            return jsonify({"error": "CAPTCHA token missing"}), 400
+
+        # Attempt login
+        result = login(email, password, captcha_token=captcha_token)
+        print(f"[LOGIN] Result: {'success' if 'success' in result else 'error'}")
+
+        if "error" in result:
+            error_message = str(result["error"])
+            status_code = 400 if "captcha" in error_message.lower() else 401
+            return jsonify({"error": error_message}), status_code
+
+        user_id = result["user_id"]
+        ban_status = get_account_ban_status(user_id)
+        if isinstance(ban_status, dict) and not ban_status.get("error") and ban_status.get("banned"):
+            return jsonify(_ban_payload(ban_status)), 403
+
+        session["user_id"] = user_id
+        return jsonify({"success": True, "user_id": user_id})
+    except Exception as e:
+        print("[LOGIN] Exception during login")
+        return jsonify({"error": "Login failed"}), 500
+
+
+# ------------------- OAUTH -------------------
+def _validate_provider(provider: str) -> str:
+    normalized = (provider or "").lower()
+    if normalized not in ALLOWED_OAUTH_PROVIDERS:
+        return ""
+    return normalized
+
+
+@app.route("/api/oauth/<provider>/start", methods=["POST", "OPTIONS"])
+def api_oauth_start(provider: str):
+    if request.method == "OPTIONS":
+        return "", 200
+
+    normalized = _validate_provider(provider)
+    if not normalized:
+        return jsonify({"error": "Unsupported provider"}), 400
+
+    try:
+        data = request.get_json() or {}
+        redirect_to = data.get("redirect_to")
+        if not redirect_to:
+            return jsonify({"error": "Missing redirect_to"}), 400
+
+        # Force implicit flow so access tokens return in the redirect fragment.
+        query_params = {"flow_type": "implicit"}
+
+        # Ensure Google grants refresh capability and consent prompt.
+        if normalized == "google":
+            query_params.update({"access_type": "offline", "prompt": "consent"})
+
+        oauth_res = supabase.auth.sign_in_with_oauth({
+            "provider": normalized,
+            "options": {
+                "redirect_to": redirect_to,
+                "query_params": query_params
+            }
+        })
+
+        # supabase-py returns an object with a .url attribute
+        url = getattr(oauth_res, "url", None)
+        if not url and isinstance(oauth_res, dict):
+            url = oauth_res.get("url")
+
+        if not url:
+            return jsonify({"error": "Unable to start OAuth flow"}), 500
+
+        return jsonify({"url": url})
+    except Exception as e:
+        print(f"[OAUTH][{normalized}] Start error")
+        return jsonify({"error": "Failed to start OAuth flow"}), 500
+
+
+@app.route("/api/oauth/<provider>/complete", methods=["POST", "OPTIONS"])
+def api_oauth_complete(provider: str):
+    if request.method == "OPTIONS":
+        return "", 200
+
+    normalized = _validate_provider(provider)
+    if not normalized:
+        return jsonify({"error": "Unsupported provider"}), 400
+
+    try:
+        data = request.get_json() or {}
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        auth_code = data.get("auth_code")
+
+        # Allow exchanging an auth code (PKCE) when no tokens are returned to the client.
+        if not access_token and auth_code:
+            try:
+                exchange = supabase.auth.exchange_code_for_session({"auth_code": auth_code})
+                session_obj = getattr(exchange, "session", None)
+                access_token = getattr(session_obj, "access_token", None)
+                refresh_token = getattr(session_obj, "refresh_token", None)
+            except Exception as exc:
+                print(f"[OAUTH][{normalized}] Code exchange failed")
+                return jsonify({"error": "Failed to exchange auth code"}), 400
+
+        # GitHub does not always return a refresh token; accept access token alone.
+        if not access_token:
+            return jsonify({"error": "Missing access token from provider"}), 400
+
+        # Validate token and get user info from Supabase
+        user_resp = supabase.auth.get_user(access_token)
+        user_obj = getattr(user_resp, "user", None)
+        user_id = getattr(user_obj, "id", None) if user_obj else None
+
+        if not user_id:
+            return jsonify({"error": "Could not fetch user from provider"}), 401
+
+        ensure_user_progress_exists(user_id)
+
+        ban_status = get_account_ban_status(user_id)
+        if isinstance(ban_status, dict) and not ban_status.get("error") and ban_status.get("banned"):
+            return jsonify(_ban_payload(ban_status)), 403
+
+        # Persist session and progress
+        session["user_id"] = user_id
+
+        return jsonify({"success": True, "user_id": user_id, "provider": normalized})
+    except Exception as e:
+        print(f"[OAUTH][{normalized}] Complete error")
+        return jsonify({"error": "OAuth completion failed"}), 500
+
+
+# ------------------- DISCORD GUILD JOIN -------------------
+def _discord_is_configured():
+    return all([
+        DISCORD_CLIENT_ID,
+        DISCORD_CLIENT_SECRET,
+        DISCORD_BOT_TOKEN,
+        DISCORD_GUILD_ID,
+        DISCORD_JOIN_REDIRECT,
+    ])
+
+
+@app.route("/api/discord/join/start", methods=["GET"])
+def discord_join_start():
+    """Begin a Discord OAuth flow to add the user to the guild using guilds.join."""
+    if not _discord_is_configured():
+        return jsonify({"error": "Discord join not configured"}), 400
+
+    next_url = request.args.get("next", "/learn/index.html")
+    state_obj = {"next": next_url}
+    state = base64.urlsafe_b64encode(json.dumps(state_obj).encode()).decode()
+
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": DISCORD_JOIN_REDIRECT,
+        "scope": "identify email guilds.join",
+        "state": state,
+    }
+
+    url = DISCORD_OAUTH_AUTHORIZE + "?" + urlencode(params)
+    return jsonify({"url": url})
+
+
+@app.route("/api/discord/join/callback", methods=["GET"])
+def discord_join_callback():
+    """Handle Discord OAuth redirect, exchange code, and add the user to the guild."""
+    if not _discord_is_configured():
+        return jsonify({"error": "Discord join not configured"}), 400
+
+    error = request.args.get("error")
+    if error:
+        return _discord_join_redirect("Discord authorization was cancelled.")
+
+    code = request.args.get("code")
+    if not code:
+        return _discord_join_redirect("Missing Discord authorization code.")
+
+    state_raw = request.args.get("state", "")
+    next_url = "/learn/index.html"
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(state_raw + "==").decode()) if state_raw else {}
+        next_url = decoded.get("next", next_url)
+    except Exception:
+        pass
+
+    try:
+        token_data = {
+            "client_id": DISCORD_CLIENT_ID,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": DISCORD_JOIN_REDIRECT,
+        }
+        print("[DISCORD JOIN] Token exchange started")
+
+        token_res = requests.post(
+            DISCORD_OAUTH_TOKEN,
+            data=token_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+
+        if not token_res.ok:
+            print(f"[DISCORD JOIN] Token exchange failed: {token_res.status_code}")
+
+        token_res.raise_for_status()
+        tokens = token_res.json()
+        user_access_token = tokens.get("access_token")
+        token_type = tokens.get("token_type", "Bearer")
+
+        if not user_access_token:
+            return _discord_join_redirect("No access token returned by Discord.")
+
+        user_res = requests.get(
+            DISCORD_API_ME,
+            headers={"Authorization": f"{token_type} {user_access_token}"},
+            timeout=10,
+        )
+        user_res.raise_for_status()
+        user_obj = user_res.json() or {}
+        user_id = user_obj.get("id")
+
+        if not user_id:
+            return _discord_join_redirect("Could not fetch Discord user.")
+
+        add_res = requests.put(
+            f"https://discord.com/api/guilds/{DISCORD_GUILD_ID}/members/{user_id}",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            json={"access_token": user_access_token},
+            timeout=10,
+        )
+
+        if add_res.status_code not in (200, 201, 204):
+            msg = _safe_discord_error(add_res)
+            return _discord_join_redirect(f"Failed to add you to the Discord server: {msg}")
+
+        return _discord_join_redirect(None, next_url)
+    except Exception as exc:
+        error_msg = type(exc).__name__
+        print("[DISCORD JOIN] Exception during Discord join")
+        return _discord_join_redirect(f"Discord join error: {error_msg}")
+
+
+def _discord_join_redirect(message: str | None, next_url: str = "/learn/index.html"):
+    """Redirect back to the app with optional error message."""
+    target = next_url
+    if message:
+        sep = "&" if "?" in target else "?"
+        target = f"{target}{sep}discord_join_error={requests.utils.quote(message)}"
+    return redirect(target, code=302)
+
+
+def _safe_discord_error(response: requests.Response) -> str:
+    try:
+        data = response.json()
+        return data.get("message") or response.text
     except Exception:
         return jsonify({"error": "Failed to save badges"}), 500
                                                                              
@@ -753,30 +1063,56 @@ def api_user_count():
 def api_trial_link():
     if request.method == "OPTIONS":
         return "", 200
-    user_id = _get_current_user_id()
+
+    user_id = session.get("user_id")
     if not user_id:
         return jsonify({"error": "Not logged in"}), 401
+
     try:
-        data       = request.get_json()
+        data = request.get_json()
+
+        # Validate required fields
         if not data:
             return jsonify({"error": "No trial data provided"}), 400
+
         session_id = data.get("sessionId")
-        course_id  = data.get("courseId")
-        chapters   = data.get("chapters", [])
+        course_id = data.get("courseId")
+        chapters = data.get("chapters", [])
+
         if not session_id or not course_id:
             return jsonify({"error": "Missing required trial data"}), 400
+
+        # Get existing user progress
         existing_progress = get_user_progress(user_id)
         if "error" in existing_progress:
-            existing_progress = {"progress": {}, "xp": 0, "streak": 0, "last_active": None, "missions": {}, "mistakes": []}
+            existing_progress = {
+                "progress": {},
+                "xp": 0,
+                "streak": 0,
+                "last_active": None,
+                "missions": {},
+                "mistakes": []
+            }
+
+        # Initialize progress structure if needed
         if "progress" not in existing_progress:
             existing_progress["progress"] = {}
+
+        # Add trial course to progress if it doesn't exist
         if course_id not in existing_progress["progress"]:
-            existing_progress["progress"][course_id] = {"started": True, "chapters": {}}
+            existing_progress["progress"][course_id] = {
+                "started": True,
+                "chapters": {}
+            }
+
+        # Link trial chapters to user progress
         if "chapters" not in existing_progress["progress"][course_id]:
             existing_progress["progress"][course_id]["chapters"] = {}
+
         for chapter in chapters:
             chapter_id   = chapter.get("chapterId")
             chapter_data = chapter.get("data", {})
+
             if chapter_id:
                 if chapter_id not in existing_progress["progress"][course_id]["chapters"]:
                     existing_progress["progress"][course_id]["chapters"][chapter_id] = {}
