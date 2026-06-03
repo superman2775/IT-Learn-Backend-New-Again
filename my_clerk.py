@@ -127,8 +127,9 @@ def create_clerk_user(
         )
         if resp.status_code in (200, 201):
             return resp.json()
-        print(f"[CLERK] create_user failed {resp.status_code}: {resp.text[:300]}")
+        print(f"[CLERK] create_user failed status={resp.status_code}")
         return None
-    except Exception as exc:
-        print(f"[CLERK] create_user exception: {exc}")
+    except Exception:
+        print("[CLERK] create_user exception")
+        return None
         return None
