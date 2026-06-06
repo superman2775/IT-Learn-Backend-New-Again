@@ -1,5 +1,6 @@
                       
 """
+RUN THIS SCRIPT ONCE ON THE SERVER (pythonanywhere) @broodje56
 migrate_users_to_clerk.py
 =========================
 Imports every Supabase auth user into Clerk, then rewrites the user_id

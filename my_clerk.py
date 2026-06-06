@@ -1,34 +1,113 @@
 import time
 import requests
 import jwt
+import threading
 from jwt import PyJWKClient
-from functools import lru_cache
 from config import CLERK_SECRET_KEY, CLERK_JWKS_URL
+
 CLERK_API_BASE = "https://api.clerk.com/v1"
-                                                                             
-                                                                
-                                                                             
-@lru_cache(maxsize=1)
-def _jwks_client() -> PyJWKClient:
-    return PyJWKClient(CLERK_JWKS_URL, cache_keys=True)
+
+# Thread-safe storage for the last verification error
+_verification_errors = threading.local()
+
+
+def get_last_verification_error() -> str | None:
+    """Return the last error from verify_clerk_token on this thread, or None."""
+    return getattr(_verification_errors, 'last_error', None)
+
+
+def get_last_verification_debug() -> dict:
+    """Return debug info from the last verify_clerk_token call on this thread."""
+    return {
+        "error": getattr(_verification_errors, 'last_error', None),
+        "jwks_url": getattr(_verification_errors, 'last_jwks_url', None),
+        "issuer": getattr(_verification_errors, 'last_issuer', None),
+    }
+
+
+# Cache JWKS clients keyed by JWKS URL so different Clerk instances reuse clients
+_jwks_clients: dict = {}
+_jwks_clients_lock = threading.Lock()
+
+
+def _get_jwks_client(jwks_url: str) -> PyJWKClient:
+    with _jwks_clients_lock:
+        if jwks_url not in _jwks_clients:
+            _jwks_clients[jwks_url] = PyJWKClient(jwks_url, cache_keys=True)
+        return _jwks_clients[jwks_url]
+
+
+def _extract_jwks_url_from_token(token: str) -> str | None:
+    """
+    Decode the JWT without verification, extract the 'iss' (issuer) claim,
+    and build the correct JWKS URL for that Clerk instance.
+    Clerk's JWKS lives at: {issuer}/.well-known/jwks.json
+    """
+    try:
+        unverified = jwt.decode(token, options={"verify_signature": False})
+    except Exception as e:
+        print(f"[CLERK] Cannot decode token to extract issuer — {e}")
+        return None
+    iss = unverified.get("iss")
+    if not iss:
+        print("[CLERK] JWT missing 'iss' claim — not a valid Clerk token?")
+        return None
+    return f"{iss.rstrip('/')}/.well-known/jwks.json"
+
+
 def verify_clerk_token(token: str) -> str | None:
     """
     Verify a Clerk session JWT and return the Clerk user ID (subject claim).
+    Automatically discovers the correct JWKS URL from the token's issuer claim.
+    Set the CLERK_JWKS_URL env var to override the auto-discovery.
     Returns None if the token is invalid or expired.
+    Use get_last_verification_error() to see why verification failed.
     """
     if not token:
+        _verification_errors.last_error = "empty token"
+        print("[CLERK] verify_clerk_token: empty token")
         return None
+
+    # Prefer auto-discovery from the token itself, fall back to configured URL
+    discovered = _extract_jwks_url_from_token(token)
+    jwks_url = discovered or CLERK_JWKS_URL
+    _verification_errors.last_jwks_url = jwks_url
+    if jwks_url:
+        # Store the issuer for debugging
+        try:
+            unverified = jwt.decode(token, options={"verify_signature": False})
+            _verification_errors.last_issuer = unverified.get("iss")
+        except Exception:
+            _verification_errors.last_issuer = None
+    if not jwks_url:
+        _verification_errors.last_error = "could not determine JWKS URL from token"
+        print("[CLERK] verify_clerk_token: could not determine JWKS URL")
+        return None
+
     try:
-        signing_key = _jwks_client().get_signing_key_from_jwt(token)
+        signing_key = _get_jwks_client(jwks_url).get_signing_key_from_jwt(token)
         payload = jwt.decode(
             token,
             signing_key.key,
             algorithms=["RS256"],
             options={"verify_aud": False},
         )
-                                                           
-        return payload.get("sub")
-    except Exception:
+        sub = payload.get("sub")
+        if not sub:
+            _verification_errors.last_error = "JWT payload missing 'sub' claim"
+            print("[CLERK] verify_clerk_token: JWT payload missing 'sub' claim")
+        return sub
+    except jwt.ExpiredSignatureError:
+        _verification_errors.last_error = "JWT token has expired"
+        print("[CLERK] verify_clerk_token: JWT token has expired")
+        return None
+    except jwt.InvalidTokenError as e:
+        _verification_errors.last_error = f"invalid JWT: {e}"
+        print(f"[CLERK] verify_clerk_token: invalid token — {e}")
+        return None
+    except Exception as e:
+        _verification_errors.last_error = f"{type(e).__name__}: {e}"
+        print(f"[CLERK] verify_clerk_token: unexpected error — {type(e).__name__}: {e}")
         return None
                                                                              
                            

@@ -24,6 +24,8 @@ from my_database import (
 )
 from my_clerk import (
     verify_clerk_token,
+    get_last_verification_error,
+    get_last_verification_debug,
     delete_clerk_user,
     update_clerk_user_password,
     count_clerk_users,
@@ -386,10 +388,47 @@ def api_auth_sync():
         return "", 200
     try:
         data  = request.get_json() or {}
-        token = data.get("token") or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        user_id = verify_clerk_token(token)
+        body_token = (
+            data.get("token")
+            or data.get("sessionToken")
+            or data.get("session_token")
+        )
+        auth_header = request.headers.get("Authorization", "")
+        header_token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else None
+
+        # Prefer body token, fall back to Authorization header
+        token = body_token or header_token
+
+        # Diagnostic: log what we received
+        if token:
+            preview = token[:20] + "..." if len(token) > 20 else token
+            source = "body" if body_token else "Authorization header"
+            print(f"[AUTH SYNC] Received token from {source} (len={len(token)}, preview='{preview}')")
+        else:
+            print(f"[AUTH SYNC] No token in body or Authorization header — body keys: {list(data.keys())}, auth header present: {bool(auth_header)}")
+
+        user_id = verify_clerk_token(token) if token else None
         if not user_id:
-            return jsonify({"error": "Invalid or expired session token"}), 401
+            debug_info = {}
+            if not token:
+                debug_info = {
+                    "reason": "no token provided",
+                    "body_keys": list(data.keys()),
+                    "auth_header_present": bool(auth_header),
+                }
+            else:
+                verification_error = get_last_verification_error() or "unknown"
+                verification_debug = get_last_verification_debug()
+                source = "body" if body_token else "Authorization header"
+                debug_info = {
+                    "reason": f"token from {source} did not verify",
+                    "verification_error": verification_error,
+                    "jwks_url": verification_debug.get("jwks_url"),
+                    "issuer": verification_debug.get("issuer"),
+                    "token_len": len(token),
+                    "token_preview": token[:30] + "..." if len(token) > 30 else token,
+                }
+            return jsonify({"error": "Invalid or expired session token", "debug": debug_info}), 401
         ban_status = get_account_ban_status(user_id)
         if isinstance(ban_status, dict) and not ban_status.get("error") and ban_status.get("banned"):
             return jsonify(_ban_payload(ban_status)), 403
@@ -891,3 +930,7 @@ def api_ai():
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
