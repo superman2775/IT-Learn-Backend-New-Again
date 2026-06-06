@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 from datetime import datetime, timezone
@@ -933,4 +935,11 @@ def api_ai():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    def _parse_bool(value):
+        return str(value).strip().lower() in {"1", "true"}
+
+    debug_value = _parse_bool(os.getenv("FLASK_DEBUG"))
+    host_value = os.getenv("FLASK_HOST", "127.0.0.1")
+    port_value = int(os.getenv("FLASK_PORT", "5000"))
+
+    app.run(debug=debug_value, host=host_value, port=port_value)
