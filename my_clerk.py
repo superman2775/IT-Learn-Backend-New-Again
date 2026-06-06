@@ -211,4 +211,3 @@ def create_clerk_user(
     except Exception:
         print("[CLERK] create_user exception")
         return None
-        return None
