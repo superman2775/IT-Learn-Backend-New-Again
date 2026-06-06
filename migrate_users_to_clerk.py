@@ -296,7 +296,7 @@ def remap_database(mapping: dict[str, str]) -> None:
                     SET progress = jsonb_set(
                         progress,
                         '{profile_reports}',
-                        (
+                        COALESCE((
                             SELECT jsonb_agg(
                                 CASE
                                     WHEN elem->>'reporter_user_id' = %s
@@ -307,7 +307,7 @@ def remap_database(mapping: dict[str, str]) -> None:
                             FROM jsonb_array_elements(
                                 COALESCE(progress->'profile_reports', '[]'::jsonb)
                             ) AS elem
-                        )
+                        ), '[]'::jsonb)
                     )
                     WHERE progress->'profile_reports' IS NOT NULL
                       AND progress::text LIKE %s
@@ -318,7 +318,7 @@ def remap_database(mapping: dict[str, str]) -> None:
                     SET progress = jsonb_set(
                         progress,
                         '{profile_reports}',
-                        (
+                        COALESCE((
                             SELECT jsonb_agg(
                                 CASE
                                     WHEN elem->>'reported_user_id' = %s
@@ -329,7 +329,7 @@ def remap_database(mapping: dict[str, str]) -> None:
                             FROM jsonb_array_elements(
                                 COALESCE(progress->'profile_reports', '[]'::jsonb)
                             ) AS elem
-                        )
+                        ), '[]'::jsonb)
                     )
                     WHERE progress->'profile_reports' IS NOT NULL
                       AND progress::text LIKE %s

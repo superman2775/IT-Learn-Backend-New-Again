@@ -540,7 +540,7 @@ def _sanitize_progress_for_save(conn, user_id: str, incoming_row: dict | None) -
     sanitized_gamification = None
     suspicious_gamification = False
     if incoming_gamification is not None:
-        sanitized_gamification = _sanitize_gamification_state(existing_gamification, incoming_gamification)
+        sanitized_gamification = _sanitize_gamification_state(incoming_gamification, existing_gamification)
         sanitized_progress["gamification"] = sanitized_gamification
         suspicious_gamification = _is_suspicious_gamification_payload(incoming_gamification, sanitized_gamification)
     elif existing_gamification:
